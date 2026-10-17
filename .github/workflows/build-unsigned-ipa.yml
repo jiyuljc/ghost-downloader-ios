@@ -1,0 +1,100 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      marketing_version:
+        description: 'CFBundleShortVersionString'
+        required: false
+        default: '1.0.0'
+      build_number:
+        description: 'CFBundleVersion'
+        required: false
+        default: '1'
+  push:
+    branches: [main]
+    paths:
+      - 'Sources/**'
+      - 'Resources/**'
+      - 'project.yml'
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+
+env:
+  SCHEME: GhostDownloader
+  APP_NAME: GhostDownloader
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      # 无签名构建：CI 里没有 Apple 证书，也不需要 —— 产出的 IPA 由用户自行重签
+      - name: Build for device (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project "${SCHEME}.xcodeproj" \
+            -scheme "${SCHEME}" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            MARKETING_VERSION="${{ inputs.marketing_version || '1.0.0' }}" \
+            CURRENT_PROJECT_VERSION="${{ inputs.build_number || '1' }}" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package into an unsigned IPA
+        run: |
+          APP="build/Build/Products/Release-iphoneos/${APP_NAME}.app"
+          test -d "$APP" || { echo "::error::找不到产物 $APP"; exit 1; }
+
+          rm -rf Payload
+          mkdir Payload
+          cp -R "$APP" Payload/
+
+          IPA="${APP_NAME}-unsigned-${{ inputs.marketing_version || '1.0.0' }}.ipa"
+          zip -qry "$IPA" Payload
+
+          unzip -l "$IPA" | head -n 15
+          ls -lh "$IPA"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-unsigned-ipa
+          path: '*.ipa'
+          if-no-files-found: error
+
+      - name: Summarize
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## 构建成功
+
+          产物是一个 **未签名** 的 IPA，不能直接拖进 iPhone。
+
+          安装方式：用 SideStore / AltStore / Sideloadly 等工具，以你自己的 Apple ID 重新签名后安装。
+
+          - 免费 Apple ID：签名 7 天后失效，需要重新签。
+          - 付费开发者账号（$99/年）：签名有效 1 年。
+          EOF
