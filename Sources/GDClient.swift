@@ -5,8 +5,11 @@ import Foundation
 ///
 /// 协议来自 `app/services/browser_service.py`：WebSocket + JSON，`PROTOCOL_VERSION = 2`。
 /// 握手 → `hello` → `hello_ack` → `subscribe_tasks` → 持续接收 `task_snapshot`。
+///
+/// 继承 `NSObject` 只为了当 `URLSessionWebSocketDelegate`：`task.resume()` 之后
+/// 立刻 `send` 并不保证连接已经建立，第一条消息必须等 `didOpenWithProtocol`。
 @MainActor
-final class GDClient: ObservableObject {
+final class GDClient: NSObject, ObservableObject {
     static let clientVersion = "1.0.0"
     /// 必须与桌面端 `PROTOCOL_VERSION` 一致，否则会被 `protocol_mismatch` 断开。
     static let protocolVersion = 2
@@ -30,12 +33,19 @@ final class GDClient: ObservableObject {
     private var createWaiters: [String: CheckedContinuation<GDCreateResult, Never>] = [:]
     private var actionWaiters: [String: CheckedContinuation<GDActionResult, Never>] = [:]
     private var pairWaiter: CheckedContinuation<String?, Never>?
+    /// 握手完成后要发的第一条消息（`hello` 或 `pair_request`）。
+    private var onSocketOpen: (() -> Void)?
+    /// 配对时桌面端给出的明确拒绝原因。
+    private var pairRejection: String?
+    /// 配对时连接层的真实错误。地址写错、被权限拦下、防火墙丢包都会在这里现形。
+    private var pairSocketError: String?
 
-    private let session: URLSession = {
+    /// delegate 用来在 WebSocket 真正握手完成后才发消息。
+    private lazy var session: URLSession = {
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 15
         configuration.waitsForConnectivity = false
-        return URLSession(configuration: configuration)
+        return URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
     }()
 
     var isUsable: Bool { phase.isConnected }
@@ -98,27 +108,36 @@ final class GDClient: ObservableObject {
     }
 
     /// 触发桌面端的配对弹窗；用户在那台电脑上点同意后返回新的配对令牌。
-    func requestPairing(server: String) async -> String? {
+    ///
+    /// 返回细分过的结果而不是 `String?`：以前把「连不上」「超时」「被拒绝」
+    /// 统一报成「电脑端没有响应或已拒绝」，根本没法排查。
+    func requestPairing(server: String) async -> GDPairOutcome {
         guard let url = Self.normalize(server) else {
             phase = .failed("服务器地址不正确")
-            return nil
+            return .unreachable("地址解析不了，检查是不是写成了 192.168.0.106:14371")
         }
         endpoint = url
         // 配对是一次性动作，不参与自动重连
         wantsConnection = false
+        pairRejection = nil
+        pairSocketError = nil
         openSocket(shouldSendHello: false)
         phase = .connecting
 
         let requestId = UUID().uuidString
-        return await withCheckedContinuation { (continuation: CheckedContinuation<String?, Never>) in
-            pairWaiter = continuation
-            sendNow([
+        // 必须等握手完成再发，握手前的 send 不保证送达
+        onSocketOpen = { [weak self] in
+            self?.sendNow([
                 "type": "pair_request",
                 "requestId": requestId,
                 "protocolVersion": Self.protocolVersion,
                 "extensionVersion": Self.clientVersion,
                 "clientKind": "ios_client",
             ])
+        }
+
+        let newToken = await withCheckedContinuation { (continuation: CheckedContinuation<String?, Never>) in
+            pairWaiter = continuation
             // 桌面端弹窗等待上限 60s，这里比它稍长一点
             Task { [weak self] in
                 try? await Task.sleep(nanoseconds: 70_000_000_000)
@@ -126,6 +145,16 @@ final class GDClient: ObservableObject {
                 self.resumePairing(with: nil)
             }
         }
+
+        if let newToken { return .paired(newToken) }
+
+        // 失败时必须把 socket 关掉。桌面端在配对期间持有 `_pairRequest`，
+        // 连接不断开的话它会一直留着，之后每次配对都被回「已有配对请求待处理」。
+        closeSocket()
+
+        if let rejection = pairRejection { return .rejected(rejection) }
+        if let error = pairSocketError { return .unreachable(error) }
+        return .timedOut
     }
 
     // MARK: - 业务操作
@@ -197,19 +226,14 @@ final class GDClient: ObservableObject {
         guard let endpoint else { return }
         closeSocket()
         phase = shouldSendHello ? .authenticating : .connecting
+        // 握手完成后再发第一条消息，其他情况（如配对）由调用方覆盖这里
+        onSocketOpen = shouldSendHello ? { [weak self] in self?.sendHelloNow() } : nil
 
         let task = session.webSocketTask(with: endpoint)
         socket = task
         task.resume()
         startReceiveLoop(task)
         startPingLoop(task)
-
-        if shouldSendHello {
-            Task { [weak self] in
-                guard let self else { return }
-                await self.sendHello()
-            }
-        }
     }
 
     private func closeSocket() {
@@ -217,12 +241,13 @@ final class GDClient: ObservableObject {
         receiveLoop = nil
         pingLoop?.cancel()
         pingLoop = nil
+        onSocketOpen = nil
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
     }
 
-    private func sendHello() async {
-        await send([
+    private func sendHelloNow() {
+        sendNow([
             "type": "hello",
             "protocolVersion": Self.protocolVersion,
             "token": token,
@@ -231,13 +256,6 @@ final class GDClient: ObservableObject {
             "clientKind": "ios_client",
             "installType": "ios",
         ])
-    }
-
-    private func send(_ object: [String: Any]) async {
-        guard let socket,
-              let data = try? JSONSerialization.data(withJSONObject: object),
-              let text = String(data: data, encoding: .utf8) else { return }
-        try? await socket.send(.string(text))
     }
 
     private func sendNow(_ object: [String: Any]) {
@@ -350,7 +368,9 @@ final class GDClient: ObservableObject {
         let ok = object["ok"] as? Bool ?? false
         let newToken = (object["token"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard ok, !newToken.isEmpty else {
-            phase = .failed(object["message"] as? String ?? "配对被拒绝")
+            let reason = object["message"] as? String ?? "配对被拒绝"
+            pairRejection = reason
+            phase = .failed(reason)
             resumePairing(with: nil)
             return
         }
@@ -367,16 +387,19 @@ final class GDClient: ObservableObject {
         let message = object["message"] as? String ?? "电脑端返回错误"
         switch object["code"] as? String {
         case "unauthorized":
+            pairRejection = message
             wantsConnection = false
             closeSocket()
             phase = .unauthorized(message)
             resumePairing(with: nil)
         case "protocol_mismatch":
+            pairRejection = message
             wantsConnection = false
             closeSocket()
             phase = .failed("协议版本不匹配：本机 v\(Self.protocolVersion)，电脑端 v\(desktopVersion)")
             resumePairing(with: nil)
         default:
+            pairRejection = message
             banner = message
             resumePairing(with: nil)
         }
@@ -390,6 +413,9 @@ final class GDClient: ObservableObject {
         pingLoop?.cancel()
         pingLoop = nil
 
+        // 连接层的错误要留下来给配对流程用，否则用户只会看到「没有响应」，
+        // 分不清是地址错、被系统拦了，还是防火墙把包丢了
+        if let error { pairSocketError = error.localizedDescription }
         resumePairing(with: nil)
 
         guard wantsConnection else {
@@ -421,4 +447,30 @@ final class GDClient: ObservableObject {
             self.openSocket(shouldSendHello: !self.token.isEmpty)
         }
     }
+}
+
+// MARK: - WebSocket 生命周期
+
+extension GDClient: URLSessionWebSocketDelegate {
+    /// 握手真正完成。在这之前 `send` 不保证送达，所以第一条消息要等这里。
+    nonisolated func urlSession(
+        _ session: URLSession,
+        webSocketTask: URLSessionWebSocketTask,
+        didOpenWithProtocol protocol: String?
+    ) {
+        Task { @MainActor [weak self] in
+            guard let self, webSocketTask === self.socket else { return }
+            let pending = self.onSocketOpen
+            self.onSocketOpen = nil
+            pending?()
+        }
+    }
+}
+
+/// 配对结果。分这么细是因为「连不上」和「被拒绝」的排查方向完全不同。
+enum GDPairOutcome {
+    case paired(String)
+    case rejected(String)
+    case unreachable(String)
+    case timedOut
 }
