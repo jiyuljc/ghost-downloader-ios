@@ -1,0 +1,148 @@
+name: Release
+
+# 打 v* 标签就自动发 Release；也可以在 Actions 页面手动填标签触发。
+#
+# 为什么用 CI 发而不是本地发：创建 Release 和上传资源都要 GitHub API 令牌，
+# 而 Actions 里的 GITHUB_TOKEN 自带 contents: write 权限，不需要任何个人令牌。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的标签，例如 v1.0.0'
+        required: true
+        default: 'v1.0.0'
+      draft:
+        description: '先存成草稿（true/false）'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+env:
+  SCHEME: GhostDownloader
+  APP_NAME: GhostDownloader
+
+jobs:
+  release:
+    runs-on: macos-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 标签名 -> 版本号：v1.0.0 => 1.0.0
+      - name: Resolve version
+        run: |
+          # 标签名 -> 版本号：v1.0.0 => 1.0.0；标签没有 v 前缀就原样使用
+          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION"   >> "$GITHUB_ENV"
+          echo "tag=$TAG  version=$VERSION"
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      # 无签名构建：CI 里没有 Apple 证书，产出的 IPA 由用户自行重签。
+      # 这与 build-unsigned-ipa.yml 完全一致，保证「Release 里的 IPA == 那个提交构建出来的 IPA」。
+      - name: Build for device (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project "${SCHEME}.xcodeproj" \
+            -scheme "${SCHEME}" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            MARKETING_VERSION="${VERSION}" \
+            CURRENT_PROJECT_VERSION="1" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package into an unsigned IPA
+        run: |
+          APP="build/Build/Products/Release-iphoneos/${APP_NAME}.app"
+          test -d "$APP" || { echo "::error::找不到产物 $APP"; exit 1; }
+
+          rm -rf Payload
+          mkdir Payload
+          cp -R "$APP" Payload/
+
+          IPA="${APP_NAME}-unsigned-${VERSION}.ipa"
+          zip -qry "$IPA" Payload
+
+          unzip -l "$IPA" | head -n 15
+          ls -lh "$IPA"
+
+      # 转发启动器必须带上 tools/gd-relay.py —— 只有那个 .bat 是跑不起来的
+      # （它内部按 %~dp0tools\gd-relay.py 找脚本）。所以打包成一个 zip，保持仓库里的相对结构。
+      - name: Package the relay launcher
+        run: |
+          test -f "启动转发.bat" || { echo "::error::找不到 启动转发.bat"; exit 1; }
+          test -f "tools/gd-relay.py" || { echo "::error::找不到 tools/gd-relay.py"; exit 1; }
+
+          rm -rf launcher gd-relay-launcher.zip
+          mkdir -p launcher/tools
+          cp "启动转发.bat" launcher/
+          cp tools/gd-relay.py launcher/tools/
+
+          ( cd launcher && zip -qry ../gd-relay-launcher.zip . )
+
+          echo "--- zip 内容 ---"
+          unzip -l gd-relay-launcher.zip
+          ls -lh gd-relay-launcher.zip
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test -f RELEASE_NOTES.md || { echo "::error::找不到 RELEASE_NOTES.md"; exit 1; }
+
+          IPA="${APP_NAME}-unsigned-${VERSION}.ipa"
+          LAUNCHER="gd-relay-launcher.zip"
+          DRAFT="${{ inputs.draft || 'false' }}"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG 已存在，改为更新"
+            gh release edit "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --notes-file RELEASE_NOTES.md \
+              --draft="$DRAFT"
+            gh release upload "$RELEASE_TAG" "$IPA" "$LAUNCHER" --clobber
+          else
+            echo "创建 Release $RELEASE_TAG"
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --notes-file RELEASE_NOTES.md \
+              --draft="$DRAFT" \
+              "$IPA" "$LAUNCHER"
+          fi
+
+      - name: Summarize
+        run: |
+          {
+            echo "## Release 已发布"
+            echo
+            echo "标签：\`$RELEASE_TAG\`"
+            echo
+            echo "页面：https://github.com/${{ github.repository }}/releases/tag/$RELEASE_TAG"
+            echo
+            echo "### 资源"
+            ls -lh *.ipa gd-relay-launcher.zip
+          } >> "$GITHUB_STEP_SUMMARY"
